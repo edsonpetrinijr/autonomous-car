@@ -1,0 +1,14 @@
+.venv/
+sim/out/
+__pycache__/
+data/
+real/out/
+# pessoal: fica só local (não vai pro repo público)
+CLAUDE.md
+STATE.md
+docs/emails-*.md
+docs/ecocar-statement.md
+docs/planning.md
+docs/gt-oportunidades.md
+docs/estudo.md
+docs/sessions/

@@ -1,0 +1,5 @@
+numpy
+matplotlib
+torch
+imageio[ffmpeg]
+# carla_sim/: pip install carla==<versão do simulador> (testado com 0.9.16, Python 3.10)
