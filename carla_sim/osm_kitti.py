@@ -19,6 +19,7 @@ import argparse
 import io
 import math
 import queue
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import carla
@@ -32,9 +33,31 @@ TIPOS_DE_RUA = ["motorway", "motorway_link", "trunk", "trunk_link", "primary", "
                 "secondary", "secondary_link", "tertiary", "tertiary_link", "unclassified", "residential"]
 
 
-def carregar_mapa(client, osm):
+def recortar_osm(dados, lat, lon, margem):
+    """Corta o .osm pra só as ruas a até `margem` metros da rota. O mapa inteiro (1,7 km, ~1000 ruas)
+    derruba o CARLA na hora de gerar a malha 3D. Mantém a rua inteira se um nó dela cai na caixa."""
+    raiz = ET.fromstring(dados)
+    dlat = margem / 111320.0
+    dlon = margem / (111320.0 * math.cos(math.radians(float(np.mean(lat)))))
+    s, n = float(np.min(lat)) - dlat, float(np.max(lat)) + dlat
+    o, l = float(np.min(lon)) - dlon, float(np.max(lon)) + dlon
+    dentro = {nd.get("id") for nd in raiz.iter("node")
+              if s <= float(nd.get("lat")) <= n and o <= float(nd.get("lon")) <= l}
+    ruas = [w for w in raiz.iter("way") if any(r.get("ref") in dentro for r in w.iter("nd"))]
+    usados = {r.get("ref") for w in ruas for r in w.iter("nd")}
+    novo = ET.Element("osm", raiz.attrib)
+    ET.SubElement(novo, "bounds", minlat=f"{s:.7f}", minlon=f"{o:.7f}", maxlat=f"{n:.7f}", maxlon=f"{l:.7f}")
+    novo.extend(nd for nd in raiz.iter("node") if nd.get("id") in usados)
+    novo.extend(ruas)
+    print(f"OSM recortado: {len(ruas)} vias (margem de {margem:.0f} m em volta da rota)")
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(novo, encoding="unicode")
+
+
+def carregar_mapa(client, osm, lat=None, lon=None, margem=300.0):
     with io.open(osm, mode="r", encoding="utf-8") as f:  # no Windows o .osm tem que ser lido como UTF-8
         dados = f.read()
+    if lat is not None and margem > 0:
+        dados = recortar_osm(dados, lat, lon, margem)
     cfg = carla.Osm2OdrSettings()
     cfg.set_osm_way_types(TIPOS_DE_RUA)  # sem calçada, ciclovia, escada
     xodr = carla.Osm2Odr.convert(dados, cfg)
@@ -43,29 +66,42 @@ def carregar_mapa(client, osm):
         vertex_distance=2.0, max_road_length=500.0,
         wall_height=0.0,       # a doc recomenda 0: no OSM, as duas mãos da rua viram ruas separadas e as paredes se cruzam
         additional_width=0.6, smooth_junctions=True, enable_mesh_visibility=True)
-    return client.generate_opendrive_world(xodr, params)
+    return client.generate_opendrive_world(xodr, params), xodr
 
 
-def geo_para_carla(cmap):
-    """Ajusta uma transformação afim lat/lon → (x, y) do CARLA, usando o caminho inverso que a API oferece.
-    (transform_to_geolocation existe no 0.9.x; o inverso nem sempre.) Na escala de 2 km, afim basta."""
-    wps = cmap.generate_waypoints(20.0)
-    xs = np.array([w.transform.location.x for w in wps])
-    ys = np.array([w.transform.location.y for w in wps])
-    gx, gy = np.meshgrid(np.linspace(xs.min(), xs.max(), 15), np.linspace(ys.min(), ys.max(), 15))
-    geo = [cmap.transform_to_geolocation(carla.Location(float(a), float(b), 0.0)) for a, b in zip(gx.ravel(), gy.ravel())]
-    A = np.c_[[g.latitude for g in geo], [g.longitude for g in geo], np.ones(len(geo))]
-    cx, rx = np.linalg.lstsq(A, gx.ravel(), rcond=None)[:2]
-    cy, ry = np.linalg.lstsq(A, gy.ravel(), rcond=None)[:2]
-    resid = math.sqrt((rx[0] + ry[0]) / len(geo)) if len(rx) and len(ry) else 0.0
-    print(f"ajuste lat/lon → CARLA: resíduo {resid:.3f} m (perto de 0 = projeção quase plana, ok)")
-    return lambda lat, lon: (np.c_[lat, lon, np.ones_like(lat)] @ cx, np.c_[lat, lon, np.ones_like(lat)] @ cy)
+def tmerc(lat, lon):
+    """Transversa de Mercator do PROJ com os padrões ("+proj=tmerc": lon_0=0, k=1, sem falso leste),
+    que é o que o Osm2Odr usa. Série de Krüger (Karney 2011), erro de milímetros. Devolve (leste, norte) em m."""
+    a, f = 6378137.0, 1 / 298.257223563
+    n = f / (2 - f)
+    A = a / (1 + n) * (1 + n ** 2 / 4 + n ** 4 / 64)
+    alfa = [n / 2 - 2 * n ** 2 / 3 + 5 * n ** 3 / 16, 13 * n ** 2 / 48 - 3 * n ** 3 / 5, 61 * n ** 3 / 240]
+    phi, lam = np.radians(lat), np.radians(lon)
+    c = 2 * math.sqrt(n) / (1 + n)
+    t = np.sinh(np.arctanh(np.sin(phi)) - c * np.arctanh(c * np.sin(phi)))
+    xi, eta = np.arctan2(t, np.cos(lam)), np.arctanh(np.sin(lam) / np.sqrt(1 + t ** 2))
+    leste = eta + sum(al * np.cos(2 * j * xi) * np.sinh(2 * j * eta) for j, al in enumerate(alfa, 1))
+    norte = xi + sum(al * np.sin(2 * j * xi) * np.cosh(2 * j * eta) for j, al in enumerate(alfa, 1))
+    return A * leste, A * norte
 
 
-def rota(cmap, arq):
+def geo_para_carla(xodr):
+    """lat/lon → (x, y) do CARLA. Não dá pra usar cmap.transform_to_geolocation: o CARLA não entende o
+    geoReference "+proj=tmerc" que o Osm2Odr escreve e cai num padrão (a rota caía a ~944 km das ruas).
+    Então: mesma projeção do conversor + o <offset> do .xodr, e y trocado de sinal (CARLA é mão esquerda)."""
+    off = ET.fromstring(xodr.encode("utf-8")).find("header/offset")
+    ox, oy = float(off.get("x")), float(off.get("y"))
+
+    def conv(lat, lon):
+        e, n = tmerc(lat, lon)
+        return e + ox, -(n + oy)
+    return conv
+
+
+def rota(cmap, xodr, arq):
     d = np.loadtxt(arq, delimiter=",")
     t, lat, lon, v, giro = d[:, 0], d[:, 1], d[:, 2], d[:, 4], d[:, 5]
-    x, y = geo_para_carla(cmap)(lat, lon)
+    x, y = geo_para_carla(xodr)(lat, lon)
     # teste: a rota cai em cima de rua?
     dist = []
     for a, b in zip(x[::5], y[::5]):
@@ -76,10 +112,19 @@ def rota(cmap, arq):
 
 
 def desenhar(world, x, y, segundos=600.0):
-    for i in range(0, len(x) - 3, 3):
-        world.debug.draw_line(carla.Location(float(x[i]), float(y[i]), 0.5),
-                              carla.Location(float(x[i + 3]), float(y[i + 3]), 0.5),
-                              thickness=0.3, color=carla.Color(255, 0, 0), life_time=segundos)
+    """Rota do KITTI como pontinhos no chão (antes: linha grossa a 0,5 m, que brilhava e escondia o carro)."""
+    for i in range(0, len(x), 2):
+        world.debug.draw_point(carla.Location(float(x[i]), float(y[i]), 0.1), size=0.06,
+                               color=carla.Color(200, 30, 30), life_time=segundos)
+
+
+def dist_polilinha(px, py, x, y, i, janela=20):
+    """Distância do carro até a rota (segmentos entre pontos), não até o ponto mais perto.
+    Medir até o ponto dava um serrote falso: com pontos a ~0,8 m, mesmo em cima da linha o erro ia de 0 a ~0,4 m."""
+    a, b = max(0, i - janela), min(len(x) - 1, i + janela)
+    x0, y0, dx, dy = x[a:b], y[a:b], x[a + 1:b + 1] - x[a:b], y[a + 1:b + 1] - y[a:b]
+    u = np.clip(((px - x0) * dx + (py - y0) * dy) / np.maximum(dx * dx + dy * dy, 1e-9), 0, 1)
+    return float(np.min(np.hypot(x0 + u * dx - px, y0 + u * dy - py)))
 
 
 def pure_pursuit(px, py, yaw, x, y, i0, ld, L):
@@ -112,6 +157,9 @@ def dirigir(world, x, y, v_kitti, giro_kitti, carro, video):
         cbp = world.get_blueprint_library().find("sensor.camera.rgb")
         cbp.set_attribute("image_size_x", "1280")
         cbp.set_attribute("image_size_y", "720")
+        for attr, val in (("bloom_intensity", "0"), ("lens_flare_intensity", "0")):  # a linha vermelha "brilhava" e lavava a imagem
+            if cbp.has_attribute(attr):
+                cbp.set_attribute(attr, val)
         cam = world.spawn_actor(cbp, carla.Transform(carla.Location(x=-10, z=7), carla.Rotation(pitch=-25)), attach_to=car)
         fila = queue.Queue()
         cam.listen(fila.put)
@@ -143,10 +191,10 @@ def dirigir(world, x, y, v_kitti, giro_kitti, carro, video):
             if cam:
                 escritor.append_data(np.frombuffer(fila.get(timeout=5.0).raw_data, np.uint8).reshape(720, 1280, 4)[:, :, [2, 1, 0]])
             esp.set_transform(carla.Transform(tr.location + carla.Location(z=60), carla.Rotation(pitch=-90)))
-            lateral = float(np.min(np.hypot(x[max(0, i - 20):i + 20] - px, y[max(0, i - 20):i + 20] - py)))
+            lateral = dist_polilinha(px, py, x, y, i)
             d_humano = math.atan(L_KITTI * giro_kitti[i] / max(v_kitti[i], 0.5))  # KITTI: giro anti-horário
             d_roda = math.radians(car.get_wheel_steer_angle(carla.VehicleWheelLocation.FL_Wheel))
-            log.append((passo * DT, lateral, v, v_ref, d_roda, d_humano, i))
+            log.append((passo * DT, lateral, v, v_ref, d_roda, d_humano, i, px, py))
     finally:
         if cam:
             cam.stop()
@@ -166,13 +214,18 @@ def main():
     p.add_argument("--carro", default="vehicle.tesla.model3")
     p.add_argument("--dirigir", action="store_true")
     p.add_argument("--video", action="store_true")
+    p.add_argument("--margem", type=float, default=300.0,
+                   help="metros de rua em volta da rota (0 = mapa inteiro, que costuma derrubar o CARLA)")
     a = p.parse_args()
 
+    d = np.loadtxt(a.rota, delimiter=",")
     client = carla.Client(a.host, a.port)
-    client.set_timeout(60.0)  # gerar o mapa demora
-    world = carregar_mapa(client, a.osm)
+    client.set_timeout(300.0)  # gerar o mapa demora
+    world, xodr = carregar_mapa(client, a.osm, d[:, 1], d[:, 2], a.margem)
+    client.set_timeout(60.0)
+    world.set_weather(carla.WeatherParameters.ClearNoon)  # o mundo gerado vinha com névoa clara
     cmap = world.get_map()
-    t, x, y, v, giro = rota(cmap, a.rota)
+    t, x, y, v, giro = rota(cmap, xodr, a.rota)
     desenhar(world, x, y)
     meio = len(x) // 2
     world.get_spectator().set_transform(carla.Transform(carla.Location(float(x[meio]), float(y[meio]), 250),
@@ -195,13 +248,13 @@ def main():
             pass
         world.apply_settings(original)
 
-    tt, lat_err, vv, vref, d_roda, d_hum, idx = log.T
+    tt, lat_err, vv, vref, d_roda, d_hum, idx, cx, cy = log.T
     print(f"pure pursuit na rota do KITTI: {tt[-1]:.0f} s (KITTI: {t[-1]:.0f} s), "
           f"erro lateral médio {lat_err.mean():.2f} m, máximo {lat_err.max():.2f} m, chegou ao índice {int(idx[-1])}/{len(x)}")
     # CARLA mede o ângulo da roda positivo = direita; KITTI giro positivo = esquerda → troca o sinal pra comparar
     print(f"volante: meu |δ| máximo {np.degrees(np.abs(d_roda)).max():.1f}°, "
           f"humano (deduzido) {np.degrees(np.abs(d_hum)).max():.1f}°")
-    np.savetxt("osm_kitti_log.csv", log, delimiter=",", header="t,erro_lateral,v,v_ref,delta_roda_rad,delta_humano_rad,indice")
+    np.savetxt("osm_kitti_log.csv", log, delimiter=",", header="t,erro_lateral,v,v_ref,delta_roda_rad,delta_humano_rad,indice,x,y")
     try:
         import matplotlib.pyplot as plt
         fig, ax = plt.subplots(2, 1, figsize=(9, 6), sharex=True)
