@@ -24,7 +24,7 @@ Every step is a small closed-loop experiment with a number at the end. Every con
 | **Real data: dead reckoning** | `real/kitti.py`, `real/estimativa.py` | KITTI drive 0009 (332 m, 46 s, real car): integrating speed + yaw rate from a lab-grade IMU drifts 2.5 m (0.8%). With a simulated consumer sensor (2% scale, 0.5°/s gyro bias): 36.6 m |
 | **Real data: EKF** | `real/estimativa.py` | Degraded GPS (σ 3 m, 1 Hz) fused with motion: RMSE 1.33 m vs 4.13 m for GPS alone and 2.13 m blind (mean of 20 noise draws). With the consumer sensor the EKF only matches GPS (4.06 m) because gyro bias is not in the state yet → next step |
 | CARLA physics | `carla_sim/circulo.py` | Same locked-steering test with real tire physics: radius grows 7.0 → 7.6 m from 10 to 30 km/h (unlike the kinematic model); loses grip at 50 km/h |
-| CARLA on real streets | `carla_sim/osm_kitti.py` | Karlsruhe streets from OpenStreetMap loaded into CARLA; pure pursuit follows the route the KITTI car drove, at its speed. **My steering tracks the human driver's** (inferred from yaw rate): RMS difference 1.1°, peak ~20° in the 74° turn. First run measured lateral error against route *points* instead of segments, which adds a fake 0–0.5 m sawtooth; fixed, re-run pending |
+| CARLA on real streets | `carla_sim/osm_kitti.py` | Karlsruhe streets from OpenStreetMap loaded into CARLA; pure pursuit follows the route the KITTI car drove, at its speed. **My steering tracks the human driver's** (inferred from yaw rate): RMS difference 1.05°, peak 19.5° vs 19.7°, no time lag. Lateral error 1.4 cm mean on straights (max 7 cm), 59 cm peak in the 74° turn, where pure pursuit cuts the corner (4 m lookahead). A first run showed a fake 0–0.5 m sawtooth because I measured distance to route *points* (~1 m apart) instead of segments |
 
 ## Highlights
 
@@ -40,9 +40,9 @@ Every step is a small closed-loop experiment with a number at the end. Every con
 
 ![KITTI drive 0009 map](docs/img/kitti_0009_map.png)
 
-**My controller vs a human driver**, same street, same speed (first run; the top plot's sawtooth is a measurement artifact, see table):
+**My controller vs a human driver**, same street, same speed. Video: [docs/media/carla_osm_kitti.mp4](docs/media/carla_osm_kitti.mp4)
 
-![CARLA on OSM streets](docs/img/carla_osm_kitti_v1.png)
+![CARLA on OSM streets](docs/img/carla_osm_kitti.png)
 
 **Even ground truth has error.** On the short drive 0005, the OXTS unit's own velocity integrates to 71.2 m while its positions add up to 69.4 m (~2.5% disagreement). On the longer drive 0009, dead reckoning with the same IMU ends only 0.8% off, so the gap looks specific to that segment. Cause still open.
 
@@ -79,7 +79,7 @@ docs/        glossary (Portuguese), figures, video
 
 - Gyro bias in the EKF state (the consumer-sensor case)
 - LiDAR scan matching (ICP) as odometry
-- Re-run `osm_kitti.py` with the corrected lateral error metric
+- Stop cutting the corner: lookahead tied to curvature, or a Stanley / MPC controller
 - A real 1/10 scale car: same model, sim to real
 
 ## Credits and licenses
