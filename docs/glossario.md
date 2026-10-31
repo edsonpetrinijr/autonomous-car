@@ -77,3 +77,14 @@ Termos na ordem em que apareceram.
 
 ## Controladores além do pure pursuit
 - **Stanley** (erro lateral + direção na roda da frente, o PD refinado; carro de Stanford no DARPA 2005) · **pure pursuit adaptativo/regulado** (ld cresce com v; o do Nav2) · **MPC** (simula o futuro com o modelo e escolhe os comandos respeitando os limites; é o que se usa em corrida).
+
+## Dado real e localização (30/out)
+- **KITTI**: dataset de um carro de verdade em Karlsruhe (2011): LiDAR Velodyne, câmeras, IMU e GPS/INS RTK (OXTS), que serve de "verdade" com ~0,3–0,5 m de precisão. Mesmo ele erra: no drive 0005, velocidade e posição discordam ~2,5%.
+- **Dead reckoning ("andar às cegas")**: integrar velocidade e giro a partir de uma pose conhecida, sem olhar nada de fora. O erro só cresce: 0,8% da distância com IMU de laboratório, ~11% com sensor comum.
+- **RMSE**: raiz do erro quadrático médio. Um número pro erro ao longo do trajeto todo; pune mais os erros grandes. Teste de sanidade: GPS com σ 3 m por eixo dá RMSE 3·√2 ≈ 4,24 m.
+- **EKF (filtro de Kalman estendido)**: o prever-corrigir do degrau 5 com incerteza. Prever com o movimento (aumenta a incerteza P), corrigir com a medida (ganho K = P/(P+R): confia em quem tem menos incerteza). "Estendido" = o modelo é curvo (cos, sin) e o filtro usa a derivada (F) em volta do ponto atual.
+- **Viés do giroscópio**: erro fixo que o giroscópio soma sempre pro mesmo lado. Ruído some na média; viés não. Solução: pôr o viés como variável do estado e deixar o filtro estimar.
+- **"O filtro só corrige o que está no modelo"**: com viés no estado, o erro do viés some (3,31 → 1,83 m); os 2% de escala da roda, que não estavam no modelo, continuaram custando ~3 m.
+- **As 4 camadas do carro autônomo**: localização (onde estou?), percepção (o que tem em volta?), planejamento (pra onde vou?), controle (como viro e acelero?). O pure pursuit é controle.
+- **OpenStreetMap → OpenDRIVE**: o mapa aberto de ruas vira o formato de estrada do CARLA (`carla.Osm2Odr`). Só ruas, sem prédios.
+- **GPS não segura faixa**: GPS de 3 m deu 1,34 m de erro lateral no CARLA e meia faixa ultrapassada 43% do tempo. Carro de verdade se localiza pela faixa (câmera) ou pelo mapa (LiDAR), com centímetros.
