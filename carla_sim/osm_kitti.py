@@ -219,7 +219,7 @@ def dirigir(world, x, y, v_kitti, giro_kitti, carro, video, localizar=None):
                 px, py, yaw = f.s[0], f.s[1], f.s[2]
                 v = max(v_roda, 0.0)  # o controle de velocidade também só vê o sensor
             delta, i = pure_pursuit(px, py, yaw, x, y, i, max(LD_MIN, LD_GANHO * v), L)
-            if i >= len(x) - 3:
+            if i >= len(x) - 3 or v_kitti[i] < 0.5:  # fim da rota: o carro do KITTI parou aqui
                 break
             v_ref = v_kitti[i]          # mesma velocidade que o KITTI andou nesse ponto
             erro = v_ref - v
