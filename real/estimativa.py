@@ -18,6 +18,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+from ekf import EKF
 from kitti import DRIVE, verdade
 
 rng = np.random.default_rng(0)
@@ -40,28 +41,15 @@ SIGMA_V = 0.2            # m/s: o quanto confio na velocidade a cada passo (chut
 SIGMA_GIRO = np.radians(1.0)  # rad/s: idem pro giroscópio
 
 
-def ekf(t, v, giro, gps, x0, y0, yaw0):
-    """Estado [x, y, θ]. gps: (N, 2) com NaN nos quadros sem leitura. Devolve a trajetória estimada."""
-    s = np.array([x0, y0, yaw0], float)
-    P = np.diag([0.1, 0.1, np.radians(1)]) ** 2  # começo quase certo (sabemos a largada)
-    R = np.eye(2) * SIGMA_GPS**2
-    H = np.array([[1.0, 0, 0], [0, 1.0, 0]])     # o GPS mede x e y, não θ
-    saida = [s.copy()]
+def ekf(t, v, giro, gps, x0, y0, yaw0, vies=False):
+    """Roda o EKF (real/ekf.py) no trecho todo. gps: (N, 2) com NaN nos quadros sem leitura. vies: estima o viés do giro."""
+    f = EKF(x0, y0, yaw0, SIGMA_GPS, SIGMA_V, SIGMA_GIRO, estimar_vies=vies)
+    saida = [f.s[:3].copy()]
     for k in range(1, len(t)):
-        dt = t[k] - t[k - 1]
-        th = s[2]
-        # prever: mesmo modelo do dead reckoning
-        s = s + np.array([v[k - 1] * np.cos(th) * dt, v[k - 1] * np.sin(th) * dt, giro[k - 1] * dt])
-        F = np.array([[1, 0, -v[k - 1] * np.sin(th) * dt], [0, 1, v[k - 1] * np.cos(th) * dt], [0, 0, 1]])
-        G = np.array([[np.cos(th) * dt, 0], [np.sin(th) * dt, 0], [0, dt]])  # como erro em v e giro vira erro de pose
-        P = F @ P @ F.T + G @ np.diag([SIGMA_V**2, SIGMA_GIRO**2]) @ G.T
-        # corrigir: só quando tem GPS
+        f.prever(v[k - 1], giro[k - 1], t[k] - t[k - 1])
         if not np.isnan(gps[k, 0]):
-            inov = gps[k] - H @ s                        # quanto o GPS discorda de mim
-            K = P @ H.T @ np.linalg.inv(H @ P @ H.T + R)  # ganho de Kalman
-            s = s + K @ inov
-            P = (np.eye(3) - K @ H) @ P
-        saida.append(s.copy())
+            f.corrigir(*gps[k])
+        saida.append(f.s[:3].copy())
     return np.array(saida)
 
 
@@ -100,7 +88,8 @@ if __name__ == "__main__":
 
     # passo 3: 20 sorteios de ruído do GPS (uma execução só não prova nada)
     print(f"\nGPS ruim: σ = {SIGMA_GPS} m a {10 / GPS_A_CADA:.0f} Hz | erro médio (RMSE), média de 20 sorteios")
-    res = {"GPS cru (só nos instantes com leitura)": [], "EKF, IMU de laboratório": [], "EKF, sensor comum (chute)": []}
+    res = {"GPS cru (só nos instantes com leitura)": [], "EKF, IMU de laboratório": [], "EKF, sensor comum (chute)": [],
+           "EKF, sensor comum + viés no estado": []}
     for sem in range(20):
         g = gps_ruim(x, y, sem)
         tem = ~np.isnan(g[:, 0])
@@ -109,6 +98,8 @@ if __name__ == "__main__":
         res["EKF, IMU de laboratório"].append(rmse(e[:, 0], e[:, 1], x, y))
         e2 = ekf(t, v_barato, giro_barato, g, x[0], y[0], yaw[0])
         res["EKF, sensor comum (chute)"].append(rmse(e2[:, 0], e2[:, 1], x, y))
+        e3 = ekf(t, v_barato, giro_barato, g, x[0], y[0], yaw[0], vies=True)
+        res["EKF, sensor comum + viés no estado"].append(rmse(e3[:, 0], e3[:, 1], x, y))
     for nome, r in res.items():
         print(f"  {nome:>38}: {np.mean(r):.2f} m  (de {np.min(r):.2f} a {np.max(r):.2f})")
     print(f"  {'às cegas, IMU de laboratório':>38}: {rmse(xb, yb, x, y):.2f} m")
