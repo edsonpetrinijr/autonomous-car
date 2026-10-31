@@ -14,6 +14,14 @@ Como rodar (máquina Windows do lab, CARLA 0.9.16 aberto, Python 3.10):
   py -3.10 osm_kitti.py                       # carrega o mapa e desenha a rota (olhe no espectador)
   py -3.10 osm_kitti.py --dirigir             # + pure pursuit seguindo a rota
   py -3.10 osm_kitti.py --dirigir --video     # + mp4 com câmera atrás do carro (pip install imageio[ffmpeg])
+  py -3.10 osm_kitti.py --dirigir --localizar # o carro NÃO sabe onde está: usa o EKF (real/ekf.py) com
+                                              # GPS ruim + velocidade + giroscópio com viés, simulados
+  py -3.10 osm_kitti.py --dirigir --localizar --sem-vies   # EKF sem o viés no estado, pra comparar
+  py -3.10 osm_kitti.py --dirigir --localizar --escala-v 0.02   # + roda 2% errada, que o EKF não conhece
+
+4. --localizar: em vez de perguntar a posição exata pro CARLA, o carro estima onde está com o mesmo
+   EKF que foi testado no KITTI. Os sensores são simulados a partir do movimento real do carro:
+   GPS com ruído de 3 m a 1 Hz, velocidade da roda com ruído, giroscópio com ruído e viés.
 """
 import argparse
 import io
@@ -22,12 +30,22 @@ import queue
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-import carla
+import sys
+
 import numpy as np
 
+try:
+    import carla
+except ImportError:  # sem CARLA dá pra importar as funções puras (pure_pursuit, dist_polilinha) e testar no Mac
+    carla = None
+
 AQUI = Path(__file__).parent
+sys.path.insert(0, str(AQUI.parent / "real"))
+from ekf import EKF  # noqa: E402  (o mesmo filtro do KITTI)
 DT = 0.05            # s, modo síncrono (igual ao circulo.py)
 L_KITTI = 2.71       # m: entre-eixos do VW Passat B6 do KITTI. Ficha técnica de memória, VERIFICAR antes de citar
+SIGMA_GPS, GPS_A_CADA = 3.0, 20   # m e passos: GPS de celular (chute) a 1 Hz, igual ao teste do KITTI
+SIGMA_V, SIGMA_GIRO = 0.2, math.radians(1.0)  # ruído da roda e do giroscópio (chute, os mesmos do KITTI)
 LD_MIN, LD_GANHO = 4.0, 0.8  # lookahead = max(4 m, 0,8 s × v). Chute; mesma lógica do degrau 3 (ld cresce com v)
 TIPOS_DE_RUA = ["motorway", "motorway_link", "trunk", "trunk_link", "primary", "primary_link",
                 "secondary", "secondary_link", "tertiary", "tertiary_link", "unclassified", "residential"]
@@ -140,7 +158,8 @@ def pure_pursuit(px, py, yaw, x, y, i0, ld, L):
     return math.atan(2 * L * math.sin(alpha) / ld), i
 
 
-def dirigir(world, x, y, v_kitti, giro_kitti, carro, video):
+def dirigir(world, x, y, v_kitti, giro_kitti, carro, video, localizar=None):
+    """localizar: None (pose perfeita do CARLA) ou dict(vies_graus, escala_v, estimar_vies, semente)."""
     bp = world.get_blueprint_library().find(carro)
     yaw0 = math.degrees(math.atan2(y[5] - y[0], x[5] - x[0]))
     wp = world.get_map().get_waypoint(carla.Location(float(x[0]), float(y[0]), 0.0))
@@ -163,7 +182,7 @@ def dirigir(world, x, y, v_kitti, giro_kitti, carro, video):
         cam = world.spawn_actor(cbp, carla.Transform(carla.Location(x=-10, z=7), carla.Rotation(pitch=-25)), attach_to=car)
         fila = queue.Queue()
         cam.listen(fila.put)
-        escritor = imageio.get_writer("osm_kitti.mp4", fps=int(round(1 / DT)))
+        escritor = imageio.get_writer("osm_kitti.mp4" if localizar is None else "osm_kitti_ekf.mp4", fps=int(round(1 / DT)))
     world.tick()
     if cam:
         while not fila.empty():
@@ -171,12 +190,34 @@ def dirigir(world, x, y, v_kitti, giro_kitti, carro, video):
 
     log, i, integral = [], 0, 0.0
     esp = world.get_spectator()
+    tr0 = car.get_transform()
+    yaw_ant = math.radians(tr0.rotation.yaw)
+    f = None
+    if localizar:
+        rng = np.random.default_rng(localizar["semente"])
+        vies = math.radians(localizar["vies_graus"])
+        f = EKF(tr0.location.x, tr0.location.y, yaw_ant, SIGMA_GPS, SIGMA_V, SIGMA_GIRO,
+                estimar_vies=localizar["estimar_vies"])  # largada conhecida, depois é com os sensores
     try:
         for passo in range(int(80 / DT)):  # teto de 80 s (o KITTI levou 46)
             tr = car.get_transform()
             vel = car.get_velocity()
             v = math.hypot(vel.x, vel.y)
-            px, py, yaw = tr.location.x, tr.location.y, math.radians(tr.rotation.yaw)
+            vx, vy, vyaw = tr.location.x, tr.location.y, math.radians(tr.rotation.yaw)  # a VERDADE
+            giro = math.atan2(math.sin(vyaw - yaw_ant), math.cos(vyaw - yaw_ant)) / DT  # giro real, na convenção do CARLA
+            yaw_ant = vyaw
+            if f is None:
+                px, py, yaw = vx, vy, vyaw  # cola: pose perfeita do simulador
+            else:
+                # sensores ruins, simulados a partir do movimento real
+                v_roda = v * (1 + localizar["escala_v"]) + rng.normal(0, 0.1)
+                giro_med = giro + vies + rng.normal(0, SIGMA_GIRO)
+                if passo > 0:
+                    f.prever(v_roda, giro_med, DT)
+                if passo % GPS_A_CADA == 0 and passo > 0:
+                    f.corrigir(vx + rng.normal(0, SIGMA_GPS), vy + rng.normal(0, SIGMA_GPS))
+                px, py, yaw = f.s[0], f.s[1], f.s[2]
+                v = max(v_roda, 0.0)  # o controle de velocidade também só vê o sensor
             delta, i = pure_pursuit(px, py, yaw, x, y, i, max(LD_MIN, LD_GANHO * v), L)
             if i >= len(x) - 3:
                 break
@@ -191,16 +232,18 @@ def dirigir(world, x, y, v_kitti, giro_kitti, carro, video):
             if cam:
                 escritor.append_data(np.frombuffer(fila.get(timeout=5.0).raw_data, np.uint8).reshape(720, 1280, 4)[:, :, [2, 1, 0]])
             esp.set_transform(carla.Transform(tr.location + carla.Location(z=60), carla.Rotation(pitch=-90)))
-            lateral = dist_polilinha(px, py, x, y, i)
+            lateral = dist_polilinha(vx, vy, x, y, i)  # erro de verdade: posição REAL até a rota
+            erro_est = math.hypot(px - vx, py - vy)       # quanto o carro acha que está longe de onde está
+            vies_est = math.degrees(f.s[3]) if f is not None and f.n == 4 else 0.0
             d_humano = math.atan(L_KITTI * giro_kitti[i] / max(v_kitti[i], 0.5))  # KITTI: giro anti-horário
             d_roda = math.radians(car.get_wheel_steer_angle(carla.VehicleWheelLocation.FL_Wheel))
-            log.append((passo * DT, lateral, v, v_ref, d_roda, d_humano, i, px, py))
+            log.append((passo * DT, lateral, v, v_ref, d_roda, d_humano, i, vx, vy, erro_est, vies_est))
     finally:
         if cam:
             cam.stop()
             cam.destroy()
             escritor.close()
-            print("vídeo: osm_kitti.mp4")
+            print("vídeo: osm_kitti.mp4" if localizar is None else "vídeo: osm_kitti_ekf.mp4")
         car.destroy()
     return np.array(log), L
 
@@ -214,6 +257,11 @@ def main():
     p.add_argument("--carro", default="vehicle.tesla.model3")
     p.add_argument("--dirigir", action="store_true")
     p.add_argument("--video", action="store_true")
+    p.add_argument("--localizar", action="store_true", help="usa o EKF com sensores ruins em vez da pose perfeita")
+    p.add_argument("--vies-giro", type=float, default=0.5, help="viés do giroscópio simulado, °/s (chute: celular)")
+    p.add_argument("--escala-v", type=float, default=0.0, help="erro de escala da roda, ex.: 0.02 = 2%%")
+    p.add_argument("--sem-vies", action="store_true", help="EKF sem o viés no estado (pra comparar)")
+    p.add_argument("--semente", type=int, default=0)
     p.add_argument("--margem", type=float, default=300.0,
                    help="metros de rua em volta da rota (0 = mapa inteiro, que costuma derrubar o CARLA)")
     a = p.parse_args()
@@ -240,7 +288,9 @@ def main():
     s.fixed_delta_seconds = DT
     world.apply_settings(s)
     try:
-        log, L = dirigir(world, x, y, v, giro, a.carro, a.video)
+        loc = dict(vies_graus=a.vies_giro, escala_v=a.escala_v, estimar_vies=not a.sem_vies,
+                   semente=a.semente) if a.localizar else None
+        log, L = dirigir(world, x, y, v, giro, a.carro, a.video, loc)
     finally:
         try:
             world.tick()
@@ -248,18 +298,29 @@ def main():
             pass
         world.apply_settings(original)
 
-    tt, lat_err, vv, vref, d_roda, d_hum, idx, cx, cy = log.T
+    tt, lat_err, vv, vref, d_roda, d_hum, idx, cx, cy, err_est, vies_est = log.T
+    modo = (f"EKF ({'sem' if a.sem_vies else 'com'} viés no estado; giroscópio com {a.vies_giro}°/s, roda {a.escala_v:+.0%})"
+            if a.localizar else "pose perfeita do CARLA")
+    print(f"modo: {modo}")
+    if a.localizar:
+        print(f"erro da estimativa de posição: média {err_est.mean():.2f} m, máximo {err_est.max():.2f} m"
+              + (f" | viés estimado no fim {vies_est[-1]:.2f}°/s (verdade {a.vies_giro})" if not a.sem_vies else ""))
     print(f"pure pursuit na rota do KITTI: {tt[-1]:.0f} s (KITTI: {t[-1]:.0f} s), "
           f"erro lateral médio {lat_err.mean():.2f} m, máximo {lat_err.max():.2f} m, chegou ao índice {int(idx[-1])}/{len(x)}")
     # CARLA mede o ângulo da roda positivo = direita; KITTI giro positivo = esquerda → troca o sinal pra comparar
     print(f"volante: meu |δ| máximo {np.degrees(np.abs(d_roda)).max():.1f}°, "
           f"humano (deduzido) {np.degrees(np.abs(d_hum)).max():.1f}°")
-    np.savetxt("osm_kitti_log.csv", log, delimiter=",", header="t,erro_lateral,v,v_ref,delta_roda_rad,delta_humano_rad,indice,x,y")
+    sufixo = ("_ekf" + ("_semvies" if a.sem_vies else "") + (f"_escala{a.escala_v:g}" if a.escala_v else "")) if a.localizar else ""
+    np.savetxt(f"osm_kitti{sufixo}_log.csv", log, delimiter=",",
+               header="t,erro_lateral,v,v_ref,delta_roda_rad,delta_humano_rad,indice,x,y,erro_estimativa,vies_estimado_graus")
     try:
         import matplotlib.pyplot as plt
         fig, ax = plt.subplots(2, 1, figsize=(9, 6), sharex=True)
-        ax[0].plot(tt, lat_err)
-        ax[0].set_ylabel("erro lateral (m)")
+        ax[0].plot(tt, lat_err, label="erro lateral real (onde o carro está × rota)")
+        if a.localizar:
+            ax[0].plot(tt, err_est, label="erro da estimativa (onde ele acha que está × onde está)", alpha=0.7)
+            ax[0].legend(fontsize=8)
+        ax[0].set_ylabel("erro (m)")
         ax[0].grid(True)
         ax[1].plot(tt, -np.degrees(d_roda), label="meu pure pursuit (roda medida no CARLA)")
         ax[1].plot(tt, np.degrees(d_hum), label="motorista do KITTI (deduzido do giro)")
@@ -267,9 +328,9 @@ def main():
         ax[1].set_xlabel("tempo (s)")
         ax[1].legend()
         ax[1].grid(True)
-        fig.suptitle("Pure pursuit dirigindo a rota real do KITTI, nas ruas do OSM")
-        fig.savefig("osm_kitti.png", dpi=120, bbox_inches="tight")
-        print("gráfico: osm_kitti.png")
+        fig.suptitle(f"Pure pursuit na rota real do KITTI, ruas do OSM: {modo}", fontsize=10)
+        fig.savefig(f"osm_kitti{sufixo}.png", dpi=120, bbox_inches="tight")
+        print(f"gráfico: osm_kitti{sufixo}.png")
     except ImportError:
         pass
 
